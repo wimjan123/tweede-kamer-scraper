@@ -43,13 +43,6 @@ python scrape.py
 python scrape.py --debug
 ```
 
-### Overwrite Existing JSON
-If you previously scraped without embedded XML and want to regenerate files with the new embedded `raw_xml` and `metadata` fields, use:
-```bash
-python scrape.py --overwrite
-```
-You can also use `--force` as an alias.
-
 ### Command Line Options
 - `--debug`: Enable detailed debug output to monitor progress and diagnose issues
 
@@ -88,7 +81,6 @@ make links OUTPUT=links.json
 ./run.sh scrape                 # Run full scraper (default)
 ./run.sh link <MEETING_ID>      # Print the report URL for one meeting
 ./run.sh links [OUTPUT.json]    # Dump all meeting->report URLs
-./run.sh extract-xmls           # Extract XMLs from existing JSONs
 ```
 
 ## Output Format
@@ -97,7 +89,6 @@ The scraper creates JSON files for each meeting in the `output/` directory:
 
 ```json
 {
-  "meeting_id": "2019D12345",
   "title": "62e vergadering, woensdag 13 maart 2019",
   "date": "2019-03-13T00:00:00",
   "url": "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Resources/...",
@@ -112,44 +103,9 @@ The scraper creates JSON files for each meeting in the `output/` directory:
       "start_timestamp": "2019-03-13T10:15:00",
       "end_timestamp": "2019-03-13T10:15:30"
     }
-  ],
-  "raw_xml": "<?xml version=\"1.0\" encoding=\"utf-8\"?>...", 
-  "metadata": {
-    "meeting_id": "2019D12345",
-    "title": "62e vergadering, woensdag 13 maart 2019",
-    "date": "2019-03-13T00:00:00",
-    "url": "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Resources/...",
-    "segments_count": 432
-  }
+  ]
 }
 ```
-
-In addition, the scraper writes the original report XML into `output/xml/<MEETING_ID>.xml` and a sidecar metadata file `output/xml/<MEETING_ID>.metadata.json` containing the JSON metadata (title, date, url, segments_count, etc.). The XML file also embeds the metadata as a base64-encoded JSON comment right after the XML declaration, so the XML is self-describing without needing the sidecar file.
-
-Example of embedded comment at the top of the XML:
-
-```
-<?xml version="1.0" encoding="utf-8"?>
-<!-- scraper-metadata:base64:eyJtZWV0aW5nX2lkIjoiLi4uIiwidGl0bGUiOiIuLi4ifQ== -->
-<vlos:vergaderverslag ...>
-  ...
-</vlos:vergaderverslag>
-```
-
-To decode the embedded metadata in Python:
-
-```python
-import base64, json, re
-from pathlib import Path
-
-xml_text = Path('output/xml/<MEETING_ID>.xml').read_text(encoding='utf-8')
-m = re.search(r'<!--\s*scraper-metadata:base64:([^\s]+)\s*-->', xml_text)
-if m:
-    meta = json.loads(base64.b64decode(m.group(1)).decode('utf-8'))
-    print(meta)
-```
-
-Use `--overwrite` to regenerate XMLs/metadata if needed.
 
 ## Technical Details
 
