@@ -6,6 +6,7 @@ Extracts rich speaker information, complete dialogue flow, and start/end timesta
 
 import os
 import json
+import base64
 import requests
 from datetime import datetime
 from urllib.parse import urljoin
@@ -18,10 +19,11 @@ class DutchParliamentScraper:
     
     BASE_URL = "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Feed"
     
-    def __init__(self, output_dir="output", debug=False):
+    def __init__(self, output_dir="output", debug=False, overwrite=False):
         """Initialize the scraper with output directory."""
         self.output_dir = output_dir
         self.debug = debug
+        self.overwrite = overwrite
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'
@@ -29,6 +31,9 @@ class DutchParliamentScraper:
         
         # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
+        # Ensure XML subdir exists for extracted originals
+        self.xml_dir = os.path.join(self.output_dir, "xml")
+        os.makedirs(self.xml_dir, exist_ok=True)
         
     def make_request(self, url, timeout=30):
         """Make HTTP request with error handling and retries."""
@@ -343,7 +348,9 @@ class DutchParliamentScraper:
             print(f"Response content type: {response.headers.get('content-type')}")
             print(f"Response content sample: {response.text[:200]}...")
         
-        root = self.parse_xml_feed(response.text)
+        xml_text = response.text
+
+        root = self.parse_xml_feed(xml_text)
         if root is None:
             return None
         
@@ -355,6 +362,7 @@ class DutchParliamentScraper:
         
         # Extract basic report information
         report_data = {
+            "meeting_id": meeting_id,
             "title": "",
             "date": "",
             "url": report_xml_url,
@@ -443,6 +451,27 @@ class DutchParliamentScraper:
                         print(f"Added segment: {spreker_info['name']} - {text_content[:100]}...")
         
         print(f"Extracted {len(report_data['segments'])} segments from report")
+        
+        # Attach raw XML and metadata snapshot for consumers
+        try:
+            # Preserve original XML payload for archival and re-processing
+            report_data["raw_xml"] = xml_text
+        except Exception:
+            # Fail-safe: ensure field exists even if encoding issues arise
+            report_data["raw_xml"] = None
+        
+        # Duplicate key metadata in a dedicated block for convenience
+        report_data["metadata"] = {
+            "meeting_id": meeting_id,
+            "title": report_data.get("title"),
+            "date": report_data.get("date"),
+            "url": report_data.get("url"),
+            "segments_count": len(report_data.get("segments", []))
+        }
+        # Save original XML next to a metadata sidecar mirroring the JSON (except raw_xml)
+        meta_copy = {k: v for k, v in report_data.items() if k != "raw_xml"}
+        self.save_report_xml(xml_text, meeting_id, metadata=meta_copy)
+
         return report_data
     
     def save_report_json(self, report_data, meeting_id):
@@ -458,6 +487,106 @@ class DutchParliamentScraper:
         except Exception as e:
             print(f"Error saving report {filename}: {e}")
             return False
+
+    def save_report_xml(self, xml_text, meeting_id, metadata=None):
+        """Save raw XML and optional metadata sidecar for a meeting."""
+        xml_path = os.path.join(self.xml_dir, f"{meeting_id}.xml")
+        meta_path = os.path.join(self.xml_dir, f"{meeting_id}.metadata.json")
+
+        # Respect overwrite flag for XML/metadata sidecars
+        if os.path.exists(xml_path) and not self.overwrite:
+            return
+
+        try:
+            # Embed metadata as a base64-encoded JSON comment after XML declaration
+            xml_out = xml_text
+            if metadata is not None:
+                meta_json = json.dumps(metadata, ensure_ascii=False)
+                meta_b64 = base64.b64encode(meta_json.encode('utf-8')).decode('ascii')
+                comment = f"<!-- scraper-metadata:base64:{meta_b64} -->\n"
+                if xml_text.lstrip().startswith('<?xml'):
+                    # Insert comment right after the XML declaration
+                    decl_end = xml_text.find('?>')
+                    if decl_end != -1:
+                        prefix = xml_text[:decl_end+2]
+                        rest = xml_text[decl_end+2:]
+                        xml_out = prefix + "\n" + comment + rest
+                    else:
+                        xml_out = comment + xml_text
+                else:
+                    xml_out = comment + xml_text
+
+            with open(xml_path, 'w', encoding='utf-8') as f:
+                f.write(xml_out)
+        except Exception as e:
+            print(f"Error saving XML for {meeting_id}: {e}")
+
+        if metadata is not None:
+            try:
+                with open(meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Error saving XML metadata for {meeting_id}: {e}")
+
+    def extract_xmls_from_existing_json(self):
+        """Post-process existing JSON files to fetch and save their XML + metadata."""
+        print("Extracting XMLs from existing JSON files...")
+        count = 0
+        skipped = 0
+        failed = 0
+
+        for name in os.listdir(self.output_dir):
+            if not name.endswith('.json'):
+                continue
+            meeting_id = name[:-5]
+            json_path = os.path.join(self.output_dir, name)
+            xml_path = os.path.join(self.xml_dir, f"{meeting_id}.xml")
+            meta_path = os.path.join(self.xml_dir, f"{meeting_id}.metadata.json")
+
+            if os.path.exists(xml_path) and not self.overwrite:
+                skipped += 1
+                continue
+
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"Failed to read {json_path}: {e}")
+                failed += 1
+                continue
+
+            report_url = data.get('url')
+            if not report_url:
+                print(f"No 'url' in {name}; cannot fetch XML.")
+                failed += 1
+                continue
+
+            # If the JSON already includes raw_xml (newer runs), prefer it to avoid re-downloading
+            raw_xml = data.get('raw_xml')
+            if raw_xml:
+                self.save_report_xml(raw_xml, meeting_id, metadata={
+                    **{k: data.get(k) for k in ('title', 'date', 'url', 'segments')},
+                    "meeting_id": meeting_id,
+                    "segments_count": len(data.get('segments', []))
+                })
+                count += 1
+                continue
+
+            # Fall back to downloading via URL
+            resp = self.make_request(report_url)
+            if not resp:
+                print(f"Failed to fetch XML for {meeting_id} from {report_url}")
+                failed += 1
+                continue
+
+            self.save_report_xml(resp.text, meeting_id, metadata={
+                **{k: data.get(k) for k in ('title', 'date', 'url', 'segments')},
+                "meeting_id": meeting_id,
+                "segments_count": len(data.get('segments', []))
+            })
+            count += 1
+
+        print(f"XML extraction complete: saved {count}, skipped {skipped}, failed {failed}.")
     
     def run(self):
         """Main execution method."""
@@ -495,7 +624,7 @@ class DutchParliamentScraper:
             # Check if file already exists
             filename = f"{meeting_id}.json"
             filepath = os.path.join(self.output_dir, filename)
-            if os.path.exists(filepath):
+            if os.path.exists(filepath) and not self.overwrite:
                 print(f"Report {filename} already exists, skipping...")
                 successful_downloads += 1
                 continue
@@ -519,9 +648,14 @@ def main():
     """Main entry point."""
     import sys
     debug = '--debug' in sys.argv
-    scraper = DutchParliamentScraper(debug=debug)
+    overwrite = '--overwrite' in sys.argv or '--force' in sys.argv
+    extract_only = '--extract-xmls' in sys.argv or '--extract-xml' in sys.argv
+    scraper = DutchParliamentScraper(debug=debug, overwrite=overwrite)
     try:
-        scraper.run()
+        if extract_only:
+            scraper.extract_xmls_from_existing_json()
+        else:
+            scraper.run()
     except KeyboardInterrupt:
         print("\nScraping interrupted by user.")
     except Exception as e:

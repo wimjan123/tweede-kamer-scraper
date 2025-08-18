@@ -12,11 +12,13 @@ Usage:
   ./run.sh scrape                # Run full scraper (default)
   ./run.sh link <MEETING_ID>     # Print report URL for a meeting
   ./run.sh links [OUTPUT.json]   # Dump all meeting->report URLs
+  ./run.sh extract-xmls          # Extract XML files from existing JSONs
 
 Examples:
   ./run.sh scrape
   ./run.sh link 1e4227e0-7c1f-4a8e-8c96-5d0e35fb8b9a
   ./run.sh links links.json
+  ./run.sh extract-xmls
 USAGE
 }
 
@@ -93,6 +95,10 @@ case "$CMD" in
       echo "🧾 Dumping all meeting->report links to stdout"
       python3 extract_link.py --all
     fi
+    ;;
+  "extract-xmls")
+    echo "🗂  Extracting XMLs from existing JSON files..."
+    python3 scrape.py --extract-xmls
     ;;
   "help"|"-h"|"--help")
     usage
