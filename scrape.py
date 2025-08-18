@@ -17,6 +17,7 @@ from lxml import etree
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import re
 
 
 class DutchParliamentScraper:
@@ -24,7 +25,7 @@ class DutchParliamentScraper:
     
     BASE_URL = "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Feed"
     
-    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.1, include_committees=True, max_concurrent=10):
+    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.1, include_committees=True, max_concurrent=10, save_raw_xml=False):
         """Initialize the scraper with output directory."""
         self.output_dir = output_dir
         self.debug = debug
@@ -32,6 +33,7 @@ class DutchParliamentScraper:
         self.delay = delay  # Delay between requests to be respectful (reduced default)
         self.include_committees = include_committees  # Include committee meetings
         self.max_concurrent = max_concurrent  # Max concurrent requests
+        self.save_raw_xml = save_raw_xml  # Save raw XML files alongside JSON
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'
@@ -39,6 +41,8 @@ class DutchParliamentScraper:
         
         # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
+        if self.save_raw_xml:
+            os.makedirs(os.path.join(self.output_dir, "raw_xml"), exist_ok=True)
         self._semaphore = None
         self._session_lock = threading.Lock()
         
@@ -338,16 +342,35 @@ class DutchParliamentScraper:
             return {"name": "Unknown", "party": None, "role": None}
         
         # Look for speaker name in VLOS structure
-        name_elem = spreker_elem.find('.//vlos:verslagnaam', vlos_ns)
+        verslagnaam_elem = spreker_elem.find('.//vlos:verslagnaam', vlos_ns)
         party_elem = spreker_elem.find('.//vlos:fractie', vlos_ns)
         role_elem = spreker_elem.find('.//vlos:functie', vlos_ns)
+        first_name_elem = spreker_elem.find('.//vlos:voornaam', vlos_ns)
         
         # Also try other possible name fields
-        if name_elem is None:
-            name_elem = spreker_elem.find('.//vlos:weergavenaam', vlos_ns)
+        weergavenaam_elem = None
+        if verslagnaam_elem is None:
+            weergavenaam_elem = spreker_elem.find('.//vlos:weergavenaam', vlos_ns)
+
+        # Build a more complete display name including first name when available
+        full_name = None
+        first = (first_name_elem.text or '').strip() if first_name_elem is not None else ''
+        verslagnaam = (verslagnaam_elem.text or '').strip() if verslagnaam_elem is not None else ''
+        weergavenaam = (weergavenaam_elem.text or '').strip() if weergavenaam_elem is not None else ''
+
+        if first and verslagnaam:
+            full_name = f"{first} {verslagnaam}".strip()
+        elif first and weergavenaam:
+            full_name = f"{first} {weergavenaam}".strip()
+        elif verslagnaam:
+            full_name = verslagnaam
+        elif weergavenaam:
+            full_name = weergavenaam
+        else:
+            full_name = "Unknown"
         
         return {
-            "name": name_elem.text if name_elem is not None else "Unknown",
+            "name": full_name,
             "party": party_elem.text if party_elem is not None else None,
             "role": role_elem.text if role_elem is not None else None
         }
@@ -360,9 +383,17 @@ class DutchParliamentScraper:
         name_elem = spreker_elem.find('.//Verslagnaam')
         party_elem = spreker_elem.find('.//Fractie')
         role_elem = spreker_elem.find('.//Functie')
+        first_elem = spreker_elem.find('.//Voornaam')
+        # Prefer first + last if available
+        if first_elem is not None and first_elem.text and name_elem is not None and name_elem.text:
+            display_name = f"{first_elem.text.strip()} {name_elem.text.strip()}"
+        elif name_elem is not None and name_elem.text:
+            display_name = name_elem.text.strip()
+        else:
+            display_name = "Unknown"
         
         return {
-            "name": name_elem.text if name_elem is not None else "Unknown",
+            "name": display_name,
             "party": party_elem.text if party_elem is not None else None,
             "role": role_elem.text if role_elem is not None else None
         }
@@ -392,6 +423,78 @@ class DutchParliamentScraper:
             return timestamp_text
         except:
             return timestamp_text
+
+    def _clean_speaker_prefix(self, text: str) -> str:
+        """Remove leading speaker name prefixes (e.g., 'De heer X:', 'Mevrouw Y (Party):').
+
+        Only strips at the very start of the text and leaves the actual spoken
+        content such as 'Voorzitter. ...' intact.
+        """
+        if not text:
+            return text
+
+        first_line, *rest = text.splitlines()
+
+        # Patterns to match common prefixes at the very start of the line
+        patterns = [
+            # Require a colon after the name/political party to avoid over-stripping
+            r'^(?:De\s+heer|Mevrouw|Minister|Staatssecretaris)\s+[^:\n\r\(]*\s*(?:\([^\)]*\))?:\s+',
+            r'^(?:De\s+voorzitter)\s*:\s*'
+        ]
+
+        cleaned = first_line
+        for pat in patterns:
+            cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE)
+
+        # Reassemble preserving remaining lines
+        if rest:
+            return "\n".join([cleaned] + rest)
+        return cleaned
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize extracted text for JSON output.
+
+        - Collapses multiple whitespace and newlines to single spaces
+        - Trims leading/trailing whitespace
+        - Keeps straight quotes; JSON will escape them
+        """
+        if not text:
+            return ""
+        # Replace newlines and tabs with spaces
+        text = re.sub(r"[\t\r\n]+", " ", text)
+        # Collapse multiple spaces
+        text = re.sub(r"\s{2,}", " ", text)
+        return text.strip()
+
+    def _merge_consecutive_segments(self, segments):
+        """Merge consecutive segments by the same speaker to avoid tiny fragments.
+
+        Segments are mergeable when the speaker dicts are identical. The merged
+        text is concatenated with a space; start time from the first segment and
+        end time from the last non-empty end timestamp are kept.
+        """
+        if not segments:
+            return []
+
+        merged = []
+        for seg in segments:
+            # Normalize text before merging to avoid stray newlines
+            seg_text = self._normalize_text(seg.get("text", ""))
+            seg = {**seg, "text": seg_text}
+
+            if merged and seg.get("speaker") == merged[-1].get("speaker"):
+                prev = merged[-1]
+                # Merge text
+                prev["text"] = (prev.get("text", "").rstrip() + " " + seg_text.lstrip()).strip()
+                # Update end timestamp if newer
+                prev_end = prev.get("end_timestamp")
+                curr_end = seg.get("end_timestamp")
+                if curr_end and (not prev_end or curr_end > prev_end):
+                    prev["end_timestamp"] = curr_end
+            else:
+                merged.append(seg)
+
+        return merged
     
     def parse_report_xml(self, report_xml_url, meeting_id):
         """Parse detailed report XML and extract transcript segments."""
@@ -416,97 +519,19 @@ class DutchParliamentScraper:
             print(f"XML root nsmap: {root.nsmap}")
             print(f"First few children: {[child.tag for child in root[:10]]}")
         
-        # Extract basic report information
-        report_data = {
-            "title": "",
-            "date": "",
+        # Use the same logic as _parse_report_data but return simpler structure for backwards compatibility
+        report_data = self._parse_report_data(root, report_xml_url)
+        
+        # Convert to old format for backwards compatibility
+        old_format = {
+            "title": report_data.get("title", ""),
+            "date": report_data.get("date", ""), 
             "url": report_xml_url,
-            "segments": []
+            "segments": report_data.get("segments", [])
         }
-        
-        # Define the VLOS namespace
-        vlos_ns = {'vlos': 'http://www.tweedekamer.nl/ggm/vergaderverslag/v1.0'}
-        
-        # This appears to be a VLOS document, extract title and date
-        title_elem = root.find('.//vlos:titel', vlos_ns)
-        if title_elem is not None:
-            report_data["title"] = title_elem.text
-        
-        datum_elem = root.find('.//vlos:datum', vlos_ns)
-        if datum_elem is not None:
-            report_data["date"] = datum_elem.text
-        
-        if self.debug:
-            print(f"Found title: {report_data['title']}")
-            print(f"Found date: {report_data['date']}")
-        
-        # Process VLOS activiteit elements (these contain speaker segments)
-        activiteiten = root.findall('.//vlos:activiteit', vlos_ns)
-        if self.debug:
-            print(f"Found {len(activiteiten)} activiteit elements")
-        
-        for act_idx, activiteit in enumerate(activiteiten):
-            # Find speaker information within this activiteit
-            sprekers = activiteit.findall('.//vlos:spreker', vlos_ns)
-            
-            # Also look for all alinea elements in this activiteit
-            all_alineas = activiteit.findall('.//vlos:alinea', vlos_ns)
-            
-            if self.debug and act_idx < 2:
-                print(f"Activiteit {act_idx}: Found {len(sprekers)} speakers and {len(all_alineas)} alinea elements")
-                if len(all_alineas) > 0:
-                    print(f"  Sample alinea texts: {[al.text[:50] if al.text else 'None' for al in all_alineas[:3]]}")
-            
-            for i, spreker in enumerate(sprekers):
-                # Extract speaker information
-                spreker_info = self.extract_vlos_speaker_info(spreker, vlos_ns)
-                
-                # Debug speaker info for first few speakers
-                if self.debug and i < 2:
-                    print(f"Speaker {i}: {spreker_info}")
-                    print(f"Speaker element: {spreker.tag}")
-                    print(f"Speaker children: {[child.tag for child in spreker]}")
-                
-                # Find all text segments (alinea elements) for this speaker
-                alineas = spreker.findall('.//vlos:alinea', vlos_ns)
-                
-                if self.debug and i < 2:
-                    print(f"Found {len(alineas)} alinea elements for speaker {i}")
-                    for j, alinea in enumerate(alineas[:3]):
-                        print(f"  Alinea {j}: '{alinea.text}'" if alinea.text else f"  Alinea {j}: No text")
-                
-                # Extract timestamps for this speaker's segment
-                start_time_elem = spreker.find('.//vlos:markeertijdbegin', vlos_ns)
-                end_time_elem = spreker.find('.//vlos:markeertijdeind', vlos_ns)
-                
-                start_timestamp = self.parse_timestamp(start_time_elem.text if start_time_elem is not None else None)
-                end_timestamp = self.parse_timestamp(end_time_elem.text if end_time_elem is not None else None)
-                
-                # Combine all text from alinea elements
-                text_parts = []
-                for alinea in alineas:
-                    if alinea.text and alinea.text.strip():
-                        text_parts.append(alinea.text.strip())
-                
-                text_content = " ".join(text_parts)
-                
-                if self.debug and i < 2:
-                    print(f"Combined text for speaker {i}: '{text_content[:200]}...'")
-                
-                if text_content.strip():  # Only add non-empty segments
-                    segment = {
-                        "speaker": spreker_info,
-                        "text": text_content,
-                        "start_timestamp": start_timestamp,
-                        "end_timestamp": end_timestamp
-                    }
-                    report_data["segments"].append(segment)
-                    
-                    if self.debug and len(report_data["segments"]) <= 3:
-                        print(f"Added segment: {spreker_info['name']} - {text_content[:100]}...")
-        
-        print(f"Extracted {len(report_data['segments'])} segments from report")
-        return report_data
+
+        print(f"Extracted {len(old_format['segments'])} segments from report")
+        return old_format
     
     def save_report_json(self, report_data, meeting_id):
         """Save report data as JSON file."""
@@ -541,6 +566,10 @@ class DutchParliamentScraper:
         if not response_text:
             return None
         
+        # Save raw XML if requested
+        if self.save_raw_xml:
+            await self.save_raw_xml_async(response_text, meeting_id)
+        
         # Parse XML in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor() as executor:
@@ -557,6 +586,19 @@ class DutchParliamentScraper:
             )
             
         return report_data
+    
+    async def save_raw_xml_async(self, xml_content, meeting_id):
+        """Save raw XML content to file asynchronously."""
+        filename = f"{meeting_id}.xml"
+        filepath = os.path.join(self.output_dir, "raw_xml", filename)
+        
+        try:
+            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+                await f.write(xml_content)
+            return True
+        except Exception as e:
+            print(f"Error saving raw XML {filename}: {e}")
+            return False
     
     def _parse_report_data(self, root, report_xml_url):
         """Helper method to parse report data (runs in thread pool)."""
@@ -602,10 +644,13 @@ class DutchParliamentScraper:
             if location_elem is not None:
                 report_data["location"] = location_elem.text or ""
         
-        # Process all woordvoerder elements (speakers)
-        woordvoerders = root.findall('.//vlos:woordvoerder', vlos_ns)
+        # Process all woordvoerder elements (speakers) - use recursive search to find all
+        woordvoerders = root.xpath('.//vlos:woordvoerder', namespaces=vlos_ns)
         
-        for woordvoerder in woordvoerders:
+        if self.debug:
+            print(f"Found {len(woordvoerders)} woordvoerder elements total")
+        
+        for idx, woordvoerder in enumerate(woordvoerders):
             # Extract speaker information
             spreker_elem = woordvoerder.find('vlos:spreker', vlos_ns)
             if spreker_elem is not None:
@@ -628,15 +673,11 @@ class DutchParliamentScraper:
                 # Find all alinea elements
                 for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
                     alinea_parts = []
-                    # Find all alineaitem elements within this alinea
+                    # Collect full text of each alineaitem including nested/tail text
                     for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
-                        if alineaitem.text and alineaitem.text.strip():
-                            alinea_parts.append(alineaitem.text.strip())
-                        # Also check for text in nested elements like nadruk
-                        for nested in alineaitem.iter():
-                            if nested.text and nested.text.strip() and nested != alineaitem:
-                                alinea_parts.append(nested.text.strip())
-                    
+                        full_text = "".join(alineaitem.itertext()).strip()
+                        if full_text:
+                            alinea_parts.append(full_text)
                     if alinea_parts:
                         text_parts.append(" ".join(alinea_parts))
             
@@ -649,16 +690,17 @@ class DutchParliamentScraper:
                         for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
                             alinea_parts = []
                             for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
-                                if alineaitem.text and alineaitem.text.strip():
-                                    alinea_parts.append(alineaitem.text.strip())
-                                for nested in alineaitem.iter():
-                                    if nested.text and nested.text.strip() and nested != alineaitem:
-                                        alinea_parts.append(nested.text.strip())
-                            
+                                full_text = "".join(alineaitem.itertext()).strip()
+                                if full_text:
+                                    alinea_parts.append(full_text)
                             if alinea_parts:
                                 text_parts.append(" ".join(alinea_parts))
             
-            text_content = "\n".join(text_parts) if text_parts else ""
+            # Join with spaces to avoid JSON newlines; then normalize
+            text_content = " ".join(text_parts) if text_parts else ""
+            # Normalize text by removing leading speaker prefix
+            text_content = self._clean_speaker_prefix(text_content)
+            text_content = self._normalize_text(text_content)
             
             # Only add segments with actual content
             if text_content.strip():
@@ -669,6 +711,9 @@ class DutchParliamentScraper:
                     "end_timestamp": end_timestamp
                 }
                 report_data["segments"].append(segment)
+                
+                if self.debug and idx < 5:
+                    print(f"Added segment {idx+1}: {spreker_info['name']} - {text_content[:100]}...")
         
         # Also check for direct aktiviteit text content (for procedural text)
         aktiviteiten = root.findall('.//vlos:activiteit', vlos_ns)
@@ -684,16 +729,15 @@ class DutchParliamentScraper:
                 for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
                     alinea_parts = []
                     for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
-                        if alineaitem.text and alineaitem.text.strip():
-                            alinea_parts.append(alineaitem.text.strip())
-                        for nested in alineaitem.iter():
-                            if nested.text and nested.text.strip() and nested != alineaitem:
-                                alinea_parts.append(nested.text.strip())
-                    
+                        full_text = "".join(alineaitem.itertext()).strip()
+                        if full_text:
+                            alinea_parts.append(full_text)
                     if alinea_parts:
                         text_parts.append(" ".join(alinea_parts))
                 
-                text_content = "\n".join(text_parts) if text_parts else ""
+                text_content = " ".join(text_parts) if text_parts else ""
+                text_content = self._clean_speaker_prefix(text_content)
+                text_content = self._normalize_text(text_content)
                 
                 if text_content.strip():
                     # Extract timing from parent aktiviteit
@@ -711,6 +755,8 @@ class DutchParliamentScraper:
                     }
                     report_data["segments"].append(segment)
         
+        # Merge consecutive fragments from the same speaker
+        report_data["segments"] = self._merge_consecutive_segments(report_data["segments"])
         return report_data
     
     async def process_single_report_async(self, session, meeting, reports_mapping, pbar):
@@ -828,6 +874,7 @@ def main():
     parser.add_argument('--delay', type=float, default=0.1, help='Delay between requests in seconds (default: 0.1)')
     parser.add_argument('--plenary-only', action='store_true', help='Only scrape plenary meetings, exclude committees (default: include all)')
     parser.add_argument('--max-concurrent', type=int, default=10, help='Maximum concurrent requests (default: 10)')
+    parser.add_argument('--save-raw-xml', action='store_true', help='Save raw XML files alongside JSON for offline processing')
     
     args = parser.parse_args()
     
@@ -837,7 +884,8 @@ def main():
         max_pages=args.max_pages,
         delay=args.delay,
         include_committees=not args.plenary_only,
-        max_concurrent=args.max_concurrent
+        max_concurrent=args.max_concurrent,
+        save_raw_xml=args.save_raw_xml
     )
     try:
         scraper.run()
