@@ -46,6 +46,43 @@ python scrape.py --debug
 ### Command Line Options
 - `--debug`: Enable detailed debug output to monitor progress and diagnose issues
 
+### Extract Only the Report Link
+Use the separate helper script to extract just the meeting report XML link(s) without running the full scraper:
+
+```bash
+# For a single meeting ID
+python extract_link.py --meeting-id <MEETING_ID>
+
+# Dump all meeting->report URL mappings to a JSON file
+python extract_link.py --all --output links.json
+```
+
+### Makefile Shortcuts
+Convenient targets are provided via `Makefile`:
+
+```bash
+# Install dependencies
+make install
+
+# Run full scraper (pass ARGS=--debug to enable debug)
+make scrape ARGS=--debug
+
+# Get single link (required: MEETING_ID)
+make link MEETING_ID=<MEETING_ID>
+
+# Dump all links (optional: OUTPUT=links.json)
+make links OUTPUT=links.json
+```
+
+### Run Script Shortcuts
+`run.sh` supports subcommands:
+
+```bash
+./run.sh scrape                 # Run full scraper (default)
+./run.sh link <MEETING_ID>      # Print the report URL for one meeting
+./run.sh links [OUTPUT.json]    # Dump all meeting->report URLs
+```
+
 ## Output Format
 
 The scraper creates JSON files for each meeting in the `output/` directory:
