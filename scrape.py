@@ -68,10 +68,22 @@ class DutchParliamentScraper:
             
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 response.raise_for_status()
-                text = await response.text()
-                # Ensure proper encoding handling
-                if response.charset is None or response.charset == 'ISO-8859-1':
-                    text = text.encode('latin-1').decode('utf-8', errors='replace')
+                # Get raw bytes first to handle encoding properly
+                raw_content = await response.read()
+                
+                # Handle BOM and encoding issues
+                if raw_content.startswith(b'\xef\xbb\xbf'):  # UTF-8 BOM
+                    raw_content = raw_content[3:]
+                    
+                # Try UTF-8 first, fall back to latin-1 and then convert to UTF-8
+                try:
+                    text = raw_content.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        text = raw_content.decode('utf-8', errors='replace')
+                    except:
+                        text = raw_content.decode('latin-1').encode('utf-8', errors='replace').decode('utf-8')
+                
                 return text
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(f"Error fetching {url}: {e}")
@@ -550,8 +562,13 @@ class DutchParliamentScraper:
         """Helper method to parse report data (runs in thread pool)."""
         # Extract basic report information
         report_data = {
+            "meeting_id": "",
             "title": "",
             "date": "",
+            "start_time": "",
+            "end_time": "",
+            "location": "",
+            "meeting_type": "",
             "url": report_xml_url,
             "segments": []
         }
@@ -559,48 +576,136 @@ class DutchParliamentScraper:
         # Define the VLOS namespace
         vlos_ns = {'vlos': 'http://www.tweedekamer.nl/ggm/vergaderverslag/v1.0'}
         
-        # This appears to be a VLOS document, extract title and date
-        title_elem = root.find('.//vlos:titel', vlos_ns)
-        if title_elem is not None:
-            report_data["title"] = title_elem.text
-        
-        datum_elem = root.find('.//vlos:datum', vlos_ns)
-        if datum_elem is not None:
-            report_data["date"] = datum_elem.text
-        
-        # Process VLOS activiteit elements (these contain speaker segments)
-        activiteiten = root.findall('.//vlos:activiteit', vlos_ns)
-        
-        for activiteit in activiteiten:
-            # Find speaker information within this activiteit
-            sprekers = activiteit.findall('.//vlos:spreker', vlos_ns)
+        # Extract basic meeting metadata
+        vergadering = root.find('.//vlos:vergadering', vlos_ns)
+        if vergadering is not None:
+            report_data["meeting_id"] = vergadering.get('objectid', '')
+            report_data["meeting_type"] = vergadering.get('soort', '')
             
-            for spreker in sprekers:
-                # Extract speaker information
-                spreker_info = self.extract_vlos_speaker_info(spreker, vlos_ns)
+            title_elem = vergadering.find('vlos:titel', vlos_ns)
+            if title_elem is not None:
+                report_data["title"] = title_elem.text or ""
+            
+            datum_elem = vergadering.find('vlos:datum', vlos_ns)
+            if datum_elem is not None:
+                report_data["date"] = datum_elem.text or ""
                 
-                # Find all text segments (alinea elements) for this speaker
-                alineas = spreker.findall('.//vlos:alinea', vlos_ns)
+            start_elem = vergadering.find('vlos:aanvangstijd', vlos_ns)
+            if start_elem is not None:
+                report_data["start_time"] = start_elem.text or ""
                 
-                # Extract timestamps for this speaker's segment
-                start_time_elem = spreker.find('.//vlos:markeertijdbegin', vlos_ns)
-                end_time_elem = spreker.find('.//vlos:markeertijdeind', vlos_ns)
+            end_elem = vergadering.find('vlos:sluiting', vlos_ns)
+            if end_elem is not None:
+                report_data["end_time"] = end_elem.text or ""
                 
-                start_timestamp = self.parse_timestamp(start_time_elem.text if start_time_elem is not None else None)
-                end_timestamp = self.parse_timestamp(end_time_elem.text if end_time_elem is not None else None)
-                
-                # Combine all text from alinea elements
+            location_elem = vergadering.find('vlos:zaal', vlos_ns)
+            if location_elem is not None:
+                report_data["location"] = location_elem.text or ""
+        
+        # Process all woordvoerder elements (speakers)
+        woordvoerders = root.findall('.//vlos:woordvoerder', vlos_ns)
+        
+        for woordvoerder in woordvoerders:
+            # Extract speaker information
+            spreker_elem = woordvoerder.find('vlos:spreker', vlos_ns)
+            if spreker_elem is not None:
+                spreker_info = self.extract_vlos_speaker_info(spreker_elem, vlos_ns)
+            else:
+                spreker_info = {"name": "Unknown", "party": None, "role": None}
+            
+            # Extract timestamps
+            start_time_elem = woordvoerder.find('vlos:markeertijdbegin', vlos_ns)
+            end_time_elem = woordvoerder.find('vlos:markeertijdeind', vlos_ns)
+            
+            start_timestamp = self.parse_timestamp(start_time_elem.text if start_time_elem is not None else None)
+            end_timestamp = self.parse_timestamp(end_time_elem.text if end_time_elem is not None else None)
+            
+            # Extract text content from tekst > alinea > alineaitem structure
+            tekst_elem = woordvoerder.find('vlos:tekst', vlos_ns)
+            text_parts = []
+            
+            if tekst_elem is not None:
+                # Find all alinea elements
+                for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
+                    alinea_parts = []
+                    # Find all alineaitem elements within this alinea
+                    for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
+                        if alineaitem.text and alineaitem.text.strip():
+                            alinea_parts.append(alineaitem.text.strip())
+                        # Also check for text in nested elements like nadruk
+                        for nested in alineaitem.iter():
+                            if nested.text and nested.text.strip() and nested != alineaitem:
+                                alinea_parts.append(nested.text.strip())
+                    
+                    if alinea_parts:
+                        text_parts.append(" ".join(alinea_parts))
+            
+            # Also check direct tekst elements in other parts (like draadboekfragment)
+            if not text_parts:
+                parent = woordvoerder.getparent()
+                if parent is not None:
+                    tekst_elems = parent.findall('.//vlos:tekst', vlos_ns)
+                    for tekst_elem in tekst_elems:
+                        for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
+                            alinea_parts = []
+                            for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
+                                if alineaitem.text and alineaitem.text.strip():
+                                    alinea_parts.append(alineaitem.text.strip())
+                                for nested in alineaitem.iter():
+                                    if nested.text and nested.text.strip() and nested != alineaitem:
+                                        alinea_parts.append(nested.text.strip())
+                            
+                            if alinea_parts:
+                                text_parts.append(" ".join(alinea_parts))
+            
+            text_content = "\n".join(text_parts) if text_parts else ""
+            
+            # Only add segments with actual content
+            if text_content.strip():
+                segment = {
+                    "speaker": spreker_info,
+                    "text": text_content.strip(),
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp
+                }
+                report_data["segments"].append(segment)
+        
+        # Also check for direct aktiviteit text content (for procedural text)
+        aktiviteiten = root.findall('.//vlos:activiteit', vlos_ns)
+        for aktiviteit in aktiviteiten:
+            # Check for direct tekst elements in activities
+            tekst_elems = aktiviteit.findall('.//vlos:tekst', vlos_ns)
+            for tekst_elem in tekst_elems:
+                # Skip if this tekst is already processed by a woordvoerder
+                if tekst_elem.getparent().tag.endswith('woordvoerder'):
+                    continue
+                    
                 text_parts = []
-                for alinea in alineas:
-                    if alinea.text and alinea.text.strip():
-                        text_parts.append(alinea.text.strip())
+                for alinea in tekst_elem.findall('.//vlos:alinea', vlos_ns):
+                    alinea_parts = []
+                    for alineaitem in alinea.findall('vlos:alineaitem', vlos_ns):
+                        if alineaitem.text and alineaitem.text.strip():
+                            alinea_parts.append(alineaitem.text.strip())
+                        for nested in alineaitem.iter():
+                            if nested.text and nested.text.strip() and nested != alineaitem:
+                                alinea_parts.append(nested.text.strip())
+                    
+                    if alinea_parts:
+                        text_parts.append(" ".join(alinea_parts))
                 
-                text_content = " ".join(text_parts)
+                text_content = "\n".join(text_parts) if text_parts else ""
                 
-                if text_content.strip():  # Only add non-empty segments
+                if text_content.strip():
+                    # Extract timing from parent aktiviteit
+                    start_time_elem = aktiviteit.find('.//vlos:markeertijdbegin', vlos_ns)
+                    end_time_elem = aktiviteit.find('.//vlos:markeertijdeind', vlos_ns)
+                    
+                    start_timestamp = self.parse_timestamp(start_time_elem.text if start_time_elem is not None else None)
+                    end_timestamp = self.parse_timestamp(end_time_elem.text if end_time_elem is not None else None)
+                    
                     segment = {
-                        "speaker": spreker_info,
-                        "text": text_content,
+                        "speaker": {"name": "Procedural", "party": None, "role": "System"},
+                        "text": text_content.strip(),
                         "start_timestamp": start_timestamp,
                         "end_timestamp": end_timestamp
                     }
