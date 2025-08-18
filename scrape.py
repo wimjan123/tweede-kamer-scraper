@@ -7,6 +7,7 @@ Extracts rich speaker information, complete dialogue flow, and start/end timesta
 import os
 import json
 import requests
+import time
 from datetime import datetime
 from urllib.parse import urljoin
 from lxml import etree
@@ -18,10 +19,13 @@ class DutchParliamentScraper:
     
     BASE_URL = "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Feed"
     
-    def __init__(self, output_dir="output", debug=False):
+    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.5, include_committees=True):
         """Initialize the scraper with output directory."""
         self.output_dir = output_dir
         self.debug = debug
+        self.max_pages = max_pages  # None means no limit
+        self.delay = delay  # Delay between requests to be respectful
+        self.include_committees = include_committees  # Include committee meetings
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'
@@ -33,8 +37,15 @@ class DutchParliamentScraper:
     def make_request(self, url, timeout=30):
         """Make HTTP request with error handling and retries."""
         try:
+            # Add delay to be respectful to the server
+            if self.delay > 0:
+                time.sleep(self.delay)
+                
             response = self.session.get(url, timeout=timeout)
             response.raise_for_status()
+            # Ensure proper encoding handling
+            if response.encoding is None or response.encoding == 'ISO-8859-1':
+                response.encoding = 'utf-8'
             return response
         except requests.exceptions.RequestException as e:
             print(f"Error fetching {url}: {e}")
@@ -43,12 +54,21 @@ class DutchParliamentScraper:
     def parse_xml_feed(self, xml_content):
         """Parse XML feed and return root element."""
         try:
-            # Remove BOM if present
-            if xml_content.startswith('\ufeff'):
-                xml_content = xml_content[1:]
-            elif xml_content.startswith('ï»¿'):  # UTF-8 BOM as seen in response
-                xml_content = xml_content[3:]
+            # Handle different types of input
+            if isinstance(xml_content, bytes):
+                # If we have bytes, decode them properly
+                try:
+                    xml_content = xml_content.decode('utf-8-sig')  # Handles BOM automatically
+                except UnicodeDecodeError:
+                    xml_content = xml_content.decode('utf-8', errors='replace')
+            else:
+                # If we have a string, remove BOM if present
+                if xml_content.startswith('\ufeff'):
+                    xml_content = xml_content[1:]
+                elif xml_content.startswith('ï»¿'):  # UTF-8 BOM as bytes in string
+                    xml_content = xml_content[3:]
             
+            # Parse the XML - no need to re-encode if we have a proper string
             return etree.fromstring(xml_content.encode('utf-8'))
         except etree.XMLSyntaxError as e:
             print(f"XML parsing error: {e}")
@@ -62,7 +82,7 @@ class DutchParliamentScraper:
         page_count = 0
         next_url = f"{self.BASE_URL}?category=Vergadering"
         
-        while next_url and page_count < 50:  # Limit to 50 pages to prevent infinite loops
+        while next_url and (self.max_pages is None or page_count < self.max_pages):
             page_count += 1
             print(f"Fetching page {page_count}...")
             
@@ -113,7 +133,11 @@ class DutchParliamentScraper:
                         else:
                             continue
                         
-                        if soort_elem is not None and soort_elem.text == "Plenair":
+                        # Include plenary meetings and optionally committee meetings
+                        if soort_elem is not None and (
+                            soort_elem.text == "Plenair" or 
+                            (self.include_committees and soort_elem.text == "Commissie")
+                        ):
                             # Extract meeting ID - it's in the root element's id attribute
                             meeting_id = content_xml.get('id')
                             
@@ -132,7 +156,8 @@ class DutchParliamentScraper:
             
             # Add page meetings to total
             plenary_meetings.extend(page_meetings)
-            print(f"Found {len(page_meetings)} plenary meetings on page {page_count} (total: {len(plenary_meetings)})")
+            meeting_types = "plenary & committee" if self.include_committees else "plenary only"
+            print(f"Found {len(page_meetings)} meetings ({meeting_types}) on page {page_count} (total: {len(plenary_meetings)})")
             
             # Look for next page link
             next_url = None
@@ -158,7 +183,7 @@ class DutchParliamentScraper:
         page_count = 0
         next_url = f"{self.BASE_URL}?category=Verslag"
         
-        while next_url and page_count < 50:  # Limit to 50 pages to prevent infinite loops
+        while next_url and (self.max_pages is None or page_count < self.max_pages):
             page_count += 1
             print(f"Fetching reports page {page_count}...")
             
@@ -518,8 +543,24 @@ class DutchParliamentScraper:
 def main():
     """Main entry point."""
     import sys
-    debug = '--debug' in sys.argv
-    scraper = DutchParliamentScraper(debug=debug)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Scrape Dutch Parliament plenary debate transcripts')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--max-pages', type=int, help='Maximum pages to scrape per feed (default: no limit)')
+    parser.add_argument('--output-dir', default='output', help='Output directory for JSON files (default: output)')
+    parser.add_argument('--delay', type=float, default=0.5, help='Delay between requests in seconds (default: 0.5)')
+    parser.add_argument('--plenary-only', action='store_true', help='Only scrape plenary meetings, exclude committees (default: include all)')
+    
+    args = parser.parse_args()
+    
+    scraper = DutchParliamentScraper(
+        output_dir=args.output_dir,
+        debug=args.debug,
+        max_pages=args.max_pages,
+        delay=args.delay,
+        include_committees=not args.plenary_only
+    )
     try:
         scraper.run()
     except KeyboardInterrupt:
