@@ -8,10 +8,15 @@ import os
 import json
 import requests
 import time
+import asyncio
+import aiohttp
+import aiofiles
 from datetime import datetime
 from urllib.parse import urljoin
 from lxml import etree
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 
 class DutchParliamentScraper:
@@ -19,13 +24,14 @@ class DutchParliamentScraper:
     
     BASE_URL = "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Feed"
     
-    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.5, include_committees=True):
+    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.1, include_committees=True, max_concurrent=10):
         """Initialize the scraper with output directory."""
         self.output_dir = output_dir
         self.debug = debug
         self.max_pages = max_pages  # None means no limit
-        self.delay = delay  # Delay between requests to be respectful
+        self.delay = delay  # Delay between requests to be respectful (reduced default)
         self.include_committees = include_committees  # Include committee meetings
+        self.max_concurrent = max_concurrent  # Max concurrent requests
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'
@@ -33,6 +39,8 @@ class DutchParliamentScraper:
         
         # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
+        self._semaphore = None
+        self._session_lock = threading.Lock()
         
     def make_request(self, url, timeout=30):
         """Make HTTP request with error handling and retries."""
@@ -48,6 +56,24 @@ class DutchParliamentScraper:
                 response.encoding = 'utf-8'
             return response
         except requests.exceptions.RequestException as e:
+            print(f"Error fetching {url}: {e}")
+            return None
+    
+    async def make_request_async(self, session, url, timeout=30):
+        """Make async HTTP request with error handling and retries."""
+        try:
+            # Add delay to be respectful to the server
+            if self.delay > 0:
+                await asyncio.sleep(self.delay)
+            
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                response.raise_for_status()
+                text = await response.text()
+                # Ensure proper encoding handling
+                if response.charset is None or response.charset == 'ISO-8859-1':
+                    text = text.encode('latin-1').decode('utf-8', errors='replace')
+                return text
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(f"Error fetching {url}: {e}")
             return None
     
@@ -484,8 +510,137 @@ class DutchParliamentScraper:
             print(f"Error saving report {filename}: {e}")
             return False
     
+    async def save_report_json_async(self, report_data, meeting_id):
+        """Save report data as JSON file asynchronously."""
+        filename = f"{meeting_id}.json"
+        filepath = os.path.join(self.output_dir, filename)
+        
+        try:
+            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(report_data, indent=2, ensure_ascii=False))
+            return True
+        except Exception as e:
+            print(f"Error saving report {filename}: {e}")
+            return False
+    
+    async def parse_report_xml_async(self, session, report_xml_url, meeting_id):
+        """Parse detailed report XML and extract transcript segments asynchronously."""
+        response_text = await self.make_request_async(session, report_xml_url)
+        if not response_text:
+            return None
+        
+        # Parse XML in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            root = await loop.run_in_executor(executor, self.parse_xml_feed, response_text)
+            if root is None:
+                return None
+            
+            # Parse report data in executor
+            report_data = await loop.run_in_executor(
+                executor, 
+                self._parse_report_data, 
+                root, 
+                report_xml_url
+            )
+            
+        return report_data
+    
+    def _parse_report_data(self, root, report_xml_url):
+        """Helper method to parse report data (runs in thread pool)."""
+        # Extract basic report information
+        report_data = {
+            "title": "",
+            "date": "",
+            "url": report_xml_url,
+            "segments": []
+        }
+        
+        # Define the VLOS namespace
+        vlos_ns = {'vlos': 'http://www.tweedekamer.nl/ggm/vergaderverslag/v1.0'}
+        
+        # This appears to be a VLOS document, extract title and date
+        title_elem = root.find('.//vlos:titel', vlos_ns)
+        if title_elem is not None:
+            report_data["title"] = title_elem.text
+        
+        datum_elem = root.find('.//vlos:datum', vlos_ns)
+        if datum_elem is not None:
+            report_data["date"] = datum_elem.text
+        
+        # Process VLOS activiteit elements (these contain speaker segments)
+        activiteiten = root.findall('.//vlos:activiteit', vlos_ns)
+        
+        for activiteit in activiteiten:
+            # Find speaker information within this activiteit
+            sprekers = activiteit.findall('.//vlos:spreker', vlos_ns)
+            
+            for spreker in sprekers:
+                # Extract speaker information
+                spreker_info = self.extract_vlos_speaker_info(spreker, vlos_ns)
+                
+                # Find all text segments (alinea elements) for this speaker
+                alineas = spreker.findall('.//vlos:alinea', vlos_ns)
+                
+                # Extract timestamps for this speaker's segment
+                start_time_elem = spreker.find('.//vlos:markeertijdbegin', vlos_ns)
+                end_time_elem = spreker.find('.//vlos:markeertijdeind', vlos_ns)
+                
+                start_timestamp = self.parse_timestamp(start_time_elem.text if start_time_elem is not None else None)
+                end_timestamp = self.parse_timestamp(end_time_elem.text if end_time_elem is not None else None)
+                
+                # Combine all text from alinea elements
+                text_parts = []
+                for alinea in alineas:
+                    if alinea.text and alinea.text.strip():
+                        text_parts.append(alinea.text.strip())
+                
+                text_content = " ".join(text_parts)
+                
+                if text_content.strip():  # Only add non-empty segments
+                    segment = {
+                        "speaker": spreker_info,
+                        "text": text_content,
+                        "start_timestamp": start_timestamp,
+                        "end_timestamp": end_timestamp
+                    }
+                    report_data["segments"].append(segment)
+        
+        return report_data
+    
+    async def process_single_report_async(self, session, meeting, reports_mapping, pbar):
+        """Process a single report asynchronously."""
+        meeting_id = meeting['id']
+        
+        # Check if we have a report for this meeting
+        if meeting_id not in reports_mapping:
+            return False
+        
+        # Check if file already exists
+        filename = f"{meeting_id}.json"
+        filepath = os.path.join(self.output_dir, filename)
+        if os.path.exists(filepath):
+            pbar.set_postfix_str(f"Report {filename} already exists, skipping...")
+            return True
+        
+        report_xml_url = reports_mapping[meeting_id]
+        
+        # Parse and save the report
+        report_data = await self.parse_report_xml_async(session, report_xml_url, meeting_id)
+        if report_data:
+            success = await self.save_report_json_async(report_data, meeting_id)
+            if success:
+                pbar.set_postfix_str(f"Processed {meeting_id}")
+                return True
+        
+        return False
+    
     def run(self):
-        """Main execution method."""
+        """Main execution method (synchronous)."""
+        return asyncio.run(self.run_async())
+    
+    async def run_async(self):
+        """Main execution method (asynchronous)."""
         print("Starting Dutch Parliament transcript scraper...")
         
         # Step 1: Fetch all plenary meetings
@@ -500,37 +655,53 @@ class DutchParliamentScraper:
             print("No reports mapping found. Exiting.")
             return
         
-        # Step 3: Process each plenary meeting
-        successful_downloads = 0
-        failed_downloads = 0
+        # Step 3: Process each plenary meeting concurrently
+        print(f"\nProcessing {len(plenary_meetings)} plenary meetings concurrently...")
+        print(f"Max concurrent requests: {self.max_concurrent}")
         
-        print(f"\nProcessing {len(plenary_meetings)} plenary meetings...")
+        # Create aiohttp session with connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrent,
+            limit_per_host=self.max_concurrent,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
         
-        for meeting in tqdm(plenary_meetings, desc="Processing meetings"):
-            meeting_id = meeting['id']
+        headers = {'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'}
+        timeout = aiohttp.ClientTimeout(total=60)
+        
+        async with aiohttp.ClientSession(
+            connector=connector, 
+            headers=headers,
+            timeout=timeout
+        ) as session:
+            # Create semaphore to limit concurrent requests
+            semaphore = asyncio.Semaphore(self.max_concurrent)
             
-            # Check if we have a report for this meeting
-            if meeting_id not in reports_mapping:
-                print(f"No report found for meeting {meeting_id}")
-                failed_downloads += 1
-                continue
+            async def process_with_semaphore(meeting, pbar):
+                async with semaphore:
+                    result = await self.process_single_report_async(session, meeting, reports_mapping, pbar)
+                    pbar.update(1)
+                    return result
             
-            report_xml_url = reports_mapping[meeting_id]
-            
-            # Check if file already exists
-            filename = f"{meeting_id}.json"
-            filepath = os.path.join(self.output_dir, filename)
-            if os.path.exists(filepath):
-                print(f"Report {filename} already exists, skipping...")
-                successful_downloads += 1
-                continue
-            
-            # Parse and save the report
-            report_data = self.parse_report_xml(report_xml_url, meeting_id)
-            if report_data and self.save_report_json(report_data, meeting_id):
-                successful_downloads += 1
-            else:
-                failed_downloads += 1
+            # Process all meetings concurrently with progress bar
+            with tqdm(total=len(plenary_meetings), desc="Processing meetings") as pbar:
+                tasks = [
+                    process_with_semaphore(meeting, pbar)
+                    for meeting in plenary_meetings
+                ]
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Count results
+        successful_downloads = sum(1 for r in results if r is True)
+        failed_downloads = len(results) - successful_downloads
+        exceptions = [r for r in results if isinstance(r, Exception)]
+        
+        if exceptions:
+            print(f"\nEncountered {len(exceptions)} exceptions during processing")
+            for exc in exceptions[:5]:  # Show first 5 exceptions
+                print(f"  {type(exc).__name__}: {exc}")
         
         # Summary
         print(f"\nScraping completed!")
@@ -549,8 +720,9 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     parser.add_argument('--max-pages', type=int, help='Maximum pages to scrape per feed (default: no limit)')
     parser.add_argument('--output-dir', default='output', help='Output directory for JSON files (default: output)')
-    parser.add_argument('--delay', type=float, default=0.5, help='Delay between requests in seconds (default: 0.5)')
+    parser.add_argument('--delay', type=float, default=0.1, help='Delay between requests in seconds (default: 0.1)')
     parser.add_argument('--plenary-only', action='store_true', help='Only scrape plenary meetings, exclude committees (default: include all)')
+    parser.add_argument('--max-concurrent', type=int, default=10, help='Maximum concurrent requests (default: 10)')
     
     args = parser.parse_args()
     
@@ -559,7 +731,8 @@ def main():
         debug=args.debug,
         max_pages=args.max_pages,
         delay=args.delay,
-        include_committees=not args.plenary_only
+        include_committees=not args.plenary_only,
+        max_concurrent=args.max_concurrent
     )
     try:
         scraper.run()
