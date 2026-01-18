@@ -22,10 +22,11 @@ import re
 
 class DutchParliamentScraper:
     """Scraper for Dutch Parliament plenary debate transcripts with timestamps."""
-    
+
     BASE_URL = "https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Feed"
+    ODATA_URL = "https://gegevensmagazijn.tweedekamer.nl/OData/v4/2.0"
     
-    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.1, include_committees=True, max_concurrent=10, save_raw_xml=False):
+    def __init__(self, output_dir="output", debug=False, max_pages=None, delay=0.1, include_committees=True, max_concurrent=10, save_raw_xml=False, since_date=None):
         """Initialize the scraper with output directory."""
         self.output_dir = output_dir
         self.debug = debug
@@ -34,6 +35,7 @@ class DutchParliamentScraper:
         self.include_committees = include_committees  # Include committee meetings
         self.max_concurrent = max_concurrent  # Max concurrent requests
         self.save_raw_xml = save_raw_xml  # Save raw XML files alongside JSON
+        self.since_date = since_date  # Filter meetings since this date (YYYY-MM-DD)
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Dutch Parliament Transcript Scraper 1.0'
@@ -335,7 +337,125 @@ class DutchParliamentScraper:
         
         print(f"Total found: {len(reports_mapping)} report mappings across {page_count} pages")
         return reports_mapping
-    
+
+    def fetch_meetings_since_date(self, since_date):
+        """Fetch meetings since a specific date using OData API with date filtering."""
+        print(f"Fetching meetings since {since_date} using OData API...")
+
+        meetings = []
+        # Build OData filter query
+        filter_query = f"Datum ge {since_date}"
+        if self.include_committees:
+            filter_query += " and (Soort eq 'Plenair' or Soort eq 'Commissie')"
+        else:
+            filter_query += " and Soort eq 'Plenair'"
+
+        next_url = f"{self.ODATA_URL}/Vergadering?$filter={filter_query}&$orderby=Datum desc"
+
+        page_count = 0
+        while next_url and (self.max_pages is None or page_count < self.max_pages):
+            page_count += 1
+            print(f"Fetching OData page {page_count}...")
+
+            response = self.make_request(next_url)
+            if not response:
+                break
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                print(f"Error parsing JSON: {e}")
+                break
+
+            # Debug output
+            if self.debug and page_count == 1:
+                print(f"OData response keys: {data.keys()}")
+                if 'value' in data and len(data['value']) > 0:
+                    print(f"First item keys: {data['value'][0].keys()}")
+
+            # Process meetings from response
+            page_meetings = []
+            for item in data.get('value', []):
+                meeting_id = item.get('Id')
+                meeting_date = item.get('Datum')
+                if meeting_id:
+                    # Format date if present (OData returns ISO format)
+                    if meeting_date and 'T' in meeting_date:
+                        meeting_date = meeting_date.split('T')[0]
+                    page_meetings.append({
+                        'id': meeting_id,
+                        'date': meeting_date
+                    })
+
+            meetings.extend(page_meetings)
+            meeting_types = "plenary & committee" if self.include_committees else "plenary only"
+            print(f"Found {len(page_meetings)} meetings ({meeting_types}) on page {page_count} (total: {len(meetings)})")
+
+            # Check for next page
+            next_url = data.get('@odata.nextLink')
+            if self.debug and next_url:
+                print(f"Next OData page: {next_url}")
+
+            if len(page_meetings) == 0:
+                print("No more meetings found, stopping pagination")
+                break
+
+        print(f"Total found: {len(meetings)} meetings since {since_date} across {page_count} pages")
+        return meetings
+
+    def fetch_reports_for_meetings(self, meeting_ids):
+        """Fetch reports for specific meeting IDs using OData API."""
+        print(f"Fetching reports for {len(meeting_ids)} meetings using OData API...")
+
+        reports_mapping = {}
+
+        # Process in batches to avoid URL length limits
+        batch_size = 10
+        for i in range(0, len(meeting_ids), batch_size):
+            batch = meeting_ids[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(meeting_ids) + batch_size - 1) // batch_size
+            print(f"Fetching reports batch {batch_num}/{total_batches}...")
+
+            # Build OData filter for batch
+            id_filters = " or ".join([f"Vergadering_Id eq {mid}" for mid in batch])
+            filter_query = f"({id_filters})"
+
+            url = f"{self.ODATA_URL}/Verslag?$filter={filter_query}&$orderby=GewijzigdOp desc"
+
+            response = self.make_request(url)
+            if not response:
+                continue
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                print(f"Error parsing JSON: {e}")
+                continue
+
+            # Debug output
+            if self.debug and batch_num == 1:
+                print(f"Verslag OData response keys: {data.keys()}")
+                if 'value' in data and len(data['value']) > 0:
+                    print(f"First verslag keys: {data['value'][0].keys()}")
+
+            # Map each meeting to its most recent report
+            for item in data.get('value', []):
+                vergadering_id = item.get('Vergadering_Id')
+                verslag_id = item.get('Id')
+                if vergadering_id and verslag_id:
+                    # Only keep the first (most recent due to orderby) report per meeting
+                    if vergadering_id not in reports_mapping:
+                        # Construct the XML URL for this verslag using Resources endpoint
+                        report_url = f"https://gegevensmagazijn.tweedekamer.nl/SyncFeed/2.0/Resources/{verslag_id}"
+                        reports_mapping[vergadering_id] = report_url
+
+                        if self.debug and len(reports_mapping) <= 3:
+                            print(f"Mapped meeting {vergadering_id} to report {verslag_id}")
+
+        print(f"Total found: {len(reports_mapping)} report mappings for {len(meeting_ids)} meetings")
+        return reports_mapping
+
     def extract_vlos_speaker_info(self, spreker_elem, vlos_ns):
         """Extract speaker information from VLOS spreker XML element."""
         if spreker_elem is None:
@@ -793,18 +913,34 @@ class DutchParliamentScraper:
     async def run_async(self):
         """Main execution method (asynchronous)."""
         print("Starting Dutch Parliament transcript scraper...")
-        
-        # Step 1: Fetch all plenary meetings
-        plenary_meetings = self.fetch_plenary_meetings()
-        if not plenary_meetings:
-            print("No plenary meetings found. Exiting.")
-            return
-        
-        # Step 2: Fetch reports mapping
-        reports_mapping = self.fetch_reports_mapping()
-        if not reports_mapping:
-            print("No reports mapping found. Exiting.")
-            return
+
+        # Use OData API with date filter if since_date is specified
+        if self.since_date:
+            # Step 1: Fetch meetings since date using OData API
+            plenary_meetings = self.fetch_meetings_since_date(self.since_date)
+            if not plenary_meetings:
+                print(f"No meetings found since {self.since_date}. Exiting.")
+                return
+
+            # Step 2: Fetch reports for these specific meetings
+            meeting_ids = [m['id'] for m in plenary_meetings]
+            reports_mapping = self.fetch_reports_for_meetings(meeting_ids)
+            if not reports_mapping:
+                print("No reports found for these meetings. Exiting.")
+                return
+        else:
+            # Original SyncFeed API approach (paginated, slower)
+            # Step 1: Fetch all plenary meetings
+            plenary_meetings = self.fetch_plenary_meetings()
+            if not plenary_meetings:
+                print("No plenary meetings found. Exiting.")
+                return
+
+            # Step 2: Fetch reports mapping
+            reports_mapping = self.fetch_reports_mapping()
+            if not reports_mapping:
+                print("No reports mapping found. Exiting.")
+                return
         
         # Step 3: Process each plenary meeting concurrently
         print(f"\nProcessing {len(plenary_meetings)} plenary meetings concurrently...")
@@ -875,9 +1011,13 @@ def main():
     parser.add_argument('--plenary-only', action='store_true', help='Only scrape plenary meetings, exclude committees (default: include all)')
     parser.add_argument('--max-concurrent', type=int, default=10, help='Maximum concurrent requests (default: 10)')
     parser.add_argument('--save-raw-xml', action='store_true', help='Save raw XML files alongside JSON for offline processing')
-    
+    parser.add_argument('--since-date', type=str, help='Only fetch meetings since this date (YYYY-MM-DD format). Uses faster OData API.')
+
     args = parser.parse_args()
     
+    # When using --since-date, automatically enable raw XML saving
+    save_raw_xml = args.save_raw_xml or (args.since_date is not None)
+
     scraper = DutchParliamentScraper(
         output_dir=args.output_dir,
         debug=args.debug,
@@ -885,7 +1025,8 @@ def main():
         delay=args.delay,
         include_committees=not args.plenary_only,
         max_concurrent=args.max_concurrent,
-        save_raw_xml=args.save_raw_xml
+        save_raw_xml=save_raw_xml,
+        since_date=args.since_date
     )
     try:
         scraper.run()
